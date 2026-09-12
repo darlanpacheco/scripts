@@ -9,7 +9,7 @@ from pathlib import Path
 CRF_480 = 22
 CRF_720 = 26
 CRF_1080 = 32
-AUDIO_BITRATE = "128k"
+AUDIO_BITRATE = "64k"
 
 
 class MediaValidator:
@@ -30,6 +30,27 @@ class MediaValidator:
 
 class MediaInspector:
     """Responsável por inspecionar faixas de mídia usando ffprobe (Single Responsibility Principle)."""
+
+    @staticmethod
+    def get_video_height(file_path: Path) -> int:
+        """Extrai a altura do primeiro vídeo para calcular o CRF automático."""
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=height",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return int(result.stdout.strip())
+        except (subprocess.CalledProcessError, ValueError):
+            return 1080  # Fallback seguro caso falhe
 
     @staticmethod
     def probe(file_path: Path, raw_json: bool = False) -> None:
@@ -58,7 +79,6 @@ class MediaInspector:
 
         print(f"\nArquivo: {file_path.name}\n" + "-" * 50)
 
-        # Contadores separados por tipo para mostrar o índice relativo (ex: 0:v:0, 0:a:0)
         v_count = 0
         a_count = 0
         s_count = 0
@@ -104,7 +124,7 @@ class MediaInspector:
 
 
 class FfmpegCommandBuilder:
-    """Responsável exclusivamente por construir a lista de argumentos para o FFmpeg (Open/Closed Principle)."""
+    """Responsável por construir a lista de argumentos para o FFmpeg com codificação x265/Opus."""
 
     def __init__(
         self, input_path: Path, output_path: Path, donor_path: Path | None = None
@@ -121,7 +141,29 @@ class FfmpegCommandBuilder:
 
     def add_video(self, track_idx: int | None) -> "FfmpegCommandBuilder":
         if track_idx is not None:
-            self.cmd.extend(["-map", f"0:v:{track_idx}", "-c:v", "copy"])
+            height = MediaInspector.get_video_height(self.input_path)
+            crf = CRF_1080
+            if height == 480:
+                crf = CRF_480
+            elif height == 720:
+                crf = CRF_720
+            elif height == 1080:
+                crf = CRF_1080
+
+            self.cmd.extend(
+                [
+                    "-map",
+                    f"0:v:{track_idx}?",
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "ultrafast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-crf",
+                    str(crf),
+                ]
+            )
         return self
 
     def add_audio(self, track_idx: int | None) -> "FfmpegCommandBuilder":
@@ -130,7 +172,7 @@ class FfmpegCommandBuilder:
             self.cmd.extend(
                 [
                     "-map",
-                    f"{source_idx}:a:{track_idx}",
+                    f"{source_idx}:a:{track_idx}?",
                     "-c:a",
                     "libopus",
                     "-b:a",
@@ -169,7 +211,7 @@ class MediaProcessor:
 
         if not self.output_path:
             print(
-                "Erro: O argumento -o/--output é obrigatório para multiplexação.",
+                "Erro: O argumento -o/--output é obrigatório para o processamento.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -198,13 +240,13 @@ class MediaProcessor:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Utilitário em Python para inspecionar, multiplexar e converter mídia estritamente por comandos."
+        description="Utilitário em Python para inspecionar e codificar mídia (x265/Opus) explicitamente."
     )
     parser.add_argument(
         "-i",
         "--input",
         required=True,
-        help="Vídeo principal de alta qualidade (obrigatório)",
+        help="Vídeo principal (obrigatório)",
     )
     parser.add_argument(
         "-p",
@@ -225,7 +267,7 @@ def parse_arguments() -> argparse.Namespace:
         "-v",
         "--video-track",
         type=int,
-        help="Índice da faixa de vídeo a ser copiada (ex: 0)",
+        help="Índice da faixa de vídeo a ser codificada (ex: 0)",
     )
     parser.add_argument(
         "-a",
