@@ -13,7 +13,7 @@ AUDIO_BITRATE = "64k"
 
 
 class MediaValidator:
-    """Responsável por validar a existência de arquivos de mídia (Single Responsibility Principle)."""
+    """Responsável por validar a existência de arquivos de mídia."""
 
     @staticmethod
     def validate_input(path: Path) -> None:
@@ -21,19 +21,12 @@ class MediaValidator:
             print(f"Erro: O arquivo de entrada '{path}' não existe.", file=sys.stderr)
             sys.exit(1)
 
-    @staticmethod
-    def validate_donor(path: Path) -> None:
-        if not path.exists():
-            print(f"Erro: O arquivo doador '{path}' não existe.", file=sys.stderr)
-            sys.exit(1)
-
 
 class MediaInspector:
-    """Responsável por inspecionar faixas de mídia usando ffprobe (Single Responsibility Principle)."""
+    """Responsável por inspecionar faixas de mídia usando ffprobe."""
 
     @staticmethod
     def get_video_height(file_path: Path) -> int:
-        """Extrai a altura do primeiro vídeo para calcular o CRF automático."""
         cmd = [
             "ffprobe",
             "-v",
@@ -50,7 +43,7 @@ class MediaInspector:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return int(result.stdout.strip())
         except (subprocess.CalledProcessError, ValueError):
-            return 1080  # Fallback seguro caso falhe
+            return 1080
 
     @staticmethod
     def probe(file_path: Path, raw_json: bool = False) -> None:
@@ -124,66 +117,62 @@ class MediaInspector:
 
 
 class FfmpegCommandBuilder:
-    """Responsável por construir a lista de argumentos para o FFmpeg com codificação x265/Opus."""
+    """Responsável por construir a lista de argumentos para o FFmpeg."""
 
-    def __init__(
-        self, input_path: Path, output_path: Path, donor_path: Path | None = None
-    ):
+    def __init__(self, input_path: Path, output_path: Path):
         self.input_path = input_path
         self.output_path = output_path
-        self.donor_path = donor_path
-        self.cmd = ["ffmpeg", "-i", str(self.input_path)]
+        self.cmd = [
+            "ffmpeg",
+            "-i",
+            str(self.input_path),
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+        ]
 
-        if self.donor_path:
-            self.cmd.extend(["-i", str(self.donor_path)])
-
-        self.cmd.extend(["-map_metadata", "-1", "-map_chapters", "-1"])
-
-    def add_video(self, track_idx: int | None) -> "FfmpegCommandBuilder":
-        if track_idx is not None:
-            height = MediaInspector.get_video_height(self.input_path)
+    def add_video(self, track_idx: int, video_enc: str) -> "FfmpegCommandBuilder":
+        height = MediaInspector.get_video_height(self.input_path)
+        crf = CRF_1080
+        if height == 480:
+            crf = CRF_480
+        elif height == 720:
+            crf = CRF_720
+        elif height == 1080:
             crf = CRF_1080
-            if height == 480:
-                crf = CRF_480
-            elif height == 720:
-                crf = CRF_720
-            elif height == 1080:
-                crf = CRF_1080
 
-            self.cmd.extend(
-                [
-                    "-map",
-                    f"0:v:{track_idx}?",
-                    "-c:v",
-                    "libx265",
-                    "-preset",
-                    "ultrafast",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-crf",
-                    str(crf),
-                ]
-            )
+        self.cmd.extend(
+            [
+                "-map",
+                f"0:v:{track_idx}?",
+                "-c:v",
+                video_enc,
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                str(crf),
+            ]
+        )
         return self
 
-    def add_audio(self, track_idx: int | None) -> "FfmpegCommandBuilder":
-        if track_idx is not None:
-            source_idx = "1" if self.donor_path else "0"
-            self.cmd.extend(
-                [
-                    "-map",
-                    f"{source_idx}:a:{track_idx}?",
-                    "-c:a",
-                    "libopus",
-                    "-b:a",
-                    AUDIO_BITRATE,
-                ]
-            )
+    def add_audio(self, track_idx: int, audio_enc: str) -> "FfmpegCommandBuilder":
+        self.cmd.extend(
+            [
+                "-map",
+                f"0:a:{track_idx}?",
+                "-c:a",
+                audio_enc,
+                "-b:a",
+                AUDIO_BITRATE,
+            ]
+        )
         return self
 
-    def add_subtitle(self, track_idx: int | None, codec: str) -> "FfmpegCommandBuilder":
-        if track_idx is not None:
-            self.cmd.extend(["-map", f"0:s:{track_idx}?", "-c:s", codec])
+    def add_subtitle(self, track_idx: int, sub_enc: str) -> "FfmpegCommandBuilder":
+        self.cmd.extend(["-map", f"0:s:{track_idx}?", "-c:s", sub_enc])
         return self
 
     def build(self) -> list[str]:
@@ -198,15 +187,12 @@ class MediaProcessor:
         self.args = args
         self.input_path = Path(args.input)
         self.output_path = Path(args.output) if args.output else None
-        self.donor_path = Path(args.donor) if args.donor else None
 
     def execute(self) -> None:
         MediaValidator.validate_input(self.input_path)
-        if self.donor_path:
-            MediaValidator.validate_donor(self.donor_path)
 
-        if self.args.probe:
-            MediaInspector.probe(self.input_path, raw_json=self.args.json)
+        if self.args.probe or self.args.raw:
+            MediaInspector.probe(self.input_path, raw_json=self.args.raw)
             return
 
         if not self.output_path:
@@ -216,13 +202,27 @@ class MediaProcessor:
             )
             sys.exit(1)
 
-        builder = FfmpegCommandBuilder(
-            self.input_path, self.output_path, self.donor_path
-        )
+        builder = FfmpegCommandBuilder(self.input_path, self.output_path)
 
-        builder.add_video(self.args.video_track)
-        builder.add_audio(self.args.audio_track)
-        builder.add_subtitle(self.args.sub_track, self.args.sub_enc)
+        v_track = self.args.video_track
+        v_enc = self.args.video_enc
+        a_track = self.args.audio_track
+        a_enc = self.args.audio_enc
+        s_track = self.args.sub_track
+        s_enc = self.args.sub_enc
+
+        if v_track is None and a_track is None and s_track is None:
+            builder.cmd.extend(["-map", "0", "-c", "copy"])
+        else:
+            if v_track is not None:
+                actual_v_enc = v_enc if v_enc is not None else "libx265"
+                builder.add_video(v_track, actual_v_enc)
+            if a_track is not None:
+                actual_a_enc = a_enc if a_enc is not None else "libopus"
+                builder.add_audio(a_track, actual_a_enc)
+            if s_track is not None:
+                actual_s_enc = s_enc if s_enc is not None else "copy"
+                builder.add_subtitle(s_track, actual_s_enc)
 
         cmd = builder.build()
 
@@ -240,7 +240,7 @@ class MediaProcessor:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Utilitário em Python para inspecionar e codificar mídia (x265/Opus) explicitamente."
+        description="Utilitário em Python para inspecionar e codificar mídia explicitamente."
     )
     parser.add_argument(
         "-i",
@@ -252,34 +252,51 @@ def parse_arguments() -> argparse.Namespace:
         "-p",
         "--probe",
         action="store_true",
-        help="Inspeciona as faixas do arquivo de entrada",
+        help="Inspeciona as faixas do arquivo de entrada formatadas",
     )
     parser.add_argument(
-        "--json",
+        "-r",
+        "--raw",
         action="store_true",
         help="Retorna a saída do probe em formato JSON bruto",
     )
     parser.add_argument(
-        "-d", "--donor", help="Vídeo doador contendo o áudio alternativo"
+        "-o",
+        "--output",
+        help="Arquivo MKV de saída final",
     )
-    parser.add_argument("-o", "--output", help="Arquivo MKV de saída final")
     parser.add_argument(
         "-v",
         "--video-track",
         type=int,
-        help="Índice da faixa de vídeo a ser codificada (ex: 0)",
+        help="Índice da faixa de vídeo",
+    )
+    parser.add_argument(
+        "-ve",
+        "--video-enc",
+        help="Codec de vídeo (padrão: libx265 se -v for informado)",
     )
     parser.add_argument(
         "-a",
         "--audio-track",
         type=int,
-        help="Índice da faixa de áudio a ser processada",
+        help="Índice da faixa de áudio",
     )
     parser.add_argument(
-        "-s", "--sub-track", type=int, help="Índice da faixa de legenda"
+        "-ae",
+        "--audio-enc",
+        help="Codec de áudio (padrão: libopus se -a for informado)",
     )
     parser.add_argument(
-        "-e", "--sub-enc", default="copy", help="Codec de legenda (padrão: copy)"
+        "-s",
+        "--sub-track",
+        type=int,
+        help="Índice da faixa de legenda",
+    )
+    parser.add_argument(
+        "-se",
+        "--sub-enc",
+        help="Codec de legenda (padrão: copy se -s for informado)",
     )
     return parser.parse_args()
 
