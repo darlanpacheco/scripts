@@ -6,9 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-CRF_480 = 22
-CRF_720 = 26
-CRF_1080 = 32
+CRF_480 = 18
+CRF_720 = 20
+CRF_1080 = 24
 AUDIO_BITRATE = "64k"
 
 
